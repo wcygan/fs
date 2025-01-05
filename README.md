@@ -1,6 +1,6 @@
 # fs
 
-`fs`, short for "File Search," is a Rust tool that searches for files in a directory using a breadth-first search (BFS). It optionally respects `.gitignore` rules, lets you filter by file extensions, controls maximum search depth, and can include or exclude hidden files.
+`fs`, short for "File Search," is a tool that searches for files in a directory using a breadth-first search (BFS). It optionally respects `.gitignore` rules, lets you filter by file extensions, controls maximum search depth, and can include or exclude hidden files.
 
 ## Quickstart
 
