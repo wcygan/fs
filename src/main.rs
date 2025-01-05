@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::sync::mpsc;
 
-/// Our CLI configuration
 #[derive(Parser, Debug)]
 #[command(author, version, about = "A file system search tool that supports .gitignore")]
 pub struct SearchConfig {
@@ -241,7 +240,6 @@ fn naive_pattern_match(name: &str, pat: &str) -> bool {
     }
     name.contains(&pat.replace('*', ""))
 }
-
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -537,30 +535,29 @@ mod tests {
     async fn test_gitignore_multi_line() -> Result<()> {
         let tmp = tempdir()?;
         let tmp_path = tmp.path();
+    
+        // IMPORTANT: Remove leading spaces so the ignore crate parses them correctly
+        let content = r#"# This is a comment
+*.log
+secret_*
 
-        // .gitignore content
-        let content = r#"
-            # This is a comment
-            *.log
-            secret_*
-            
-            # blank line above
-            *.tmp
-        "#;
+# blank line above
+*.tmp
+"#;
         let gitignore_path = tmp_path.join(".gitignore");
         stdfs::write(&gitignore_path, content)?;
-
+    
         // Create files
         let f_log = tmp_path.join("debug.log");
         let f_secret = tmp_path.join("secret_file.txt");
         let f_tmp = tmp_path.join("random.tmp");
         let f_txt = tmp_path.join("notes.txt");
-
+    
         stdfs::write(&f_log, "log")?;
         stdfs::write(&f_secret, "secret")?;
         stdfs::write(&f_tmp, "tmp data")?;
         stdfs::write(&f_txt, "notes")?;
-
+    
         let config = SearchConfig {
             root_path: tmp_path.to_path_buf(),
             pattern: "*".into(),
@@ -570,12 +567,33 @@ mod tests {
             include_gitignored: false,
         };
         let found = collect_results(search_files(&config).await).await;
-
-        // Only notes.txt is not ignored
-        assert!(found.contains(&f_txt));
+    
+        // Debug output
+        println!("Found files: {:?}", found);
+        println!("Gitignore content:\n{}", content);
+        
+        // We expect to see only notes.txt and the .gitignore itself
+        let expected: Vec<_> = vec![
+            tmp_path.join(".gitignore"),
+            tmp_path.join("notes.txt"),
+        ];
+        
+        assert_eq!(
+            found.len(),
+            expected.len(),
+            "Expected exactly {} files, found {}",
+            expected.len(),
+            found.len()
+        );
+        for path in &expected {
+            assert!(found.contains(path), "Expected to find: {}", path.display());
+        }
+        
+        // Additional specific checks
         assert!(!found.contains(&f_log), "Should ignore *.log");
         assert!(!found.contains(&f_secret), "Should ignore secret_*");
         assert!(!found.contains(&f_tmp), "Should ignore *.tmp");
+    
         Ok(())
     }
 
