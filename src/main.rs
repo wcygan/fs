@@ -4,14 +4,15 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::sync::mpsc;
 
+/// Our CLI configuration
 #[derive(Parser, Debug)]
-#[command(author, version, about = "A file system search tool")]
+#[command(author, version, about = "A file system search tool that supports .gitignore")]
 pub struct SearchConfig {
     /// The root directory to start the search from
     #[arg(default_value = ".")]
     pub root_path: PathBuf,
 
-    /// Search pattern to match against file names (use '*' or '?' as wildcards, or adapt to real globs)
+    /// Search pattern to match against file names (use '*' wildcard; naive only)
     #[arg(short, long, default_value = "*")]
     pub pattern: String,
 
@@ -23,12 +24,12 @@ pub struct SearchConfig {
     #[arg(short, long, value_delimiter = ',')]
     pub extensions: Option<Vec<String>>,
 
-    /// Show hidden files and directories (Unix: name starts with '.', Windows: hidden attribute)
+    /// Show hidden files and directories (Unix: name starts with '.', Windows: hidden attribute set)
     #[arg(short = 'H', long, default_value_t = false)]
     pub show_hidden: bool,
 
     /// By default, we read .gitignore in the root directory and ignore those paths.
-    /// If this is set, we do NOT ignore them (i.e., we include gitignored files too).
+    /// If set, we do NOT ignore them (i.e., we include gitignored files).
     #[arg(long, default_value_t = false)]
     pub include_gitignored: bool,
 }
@@ -52,12 +53,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Top-level async entry to our crawler/search engine.
-/// Spawns a task that uses BFS to traverse the filesystem.
+/// Creates an mpsc channel and spawns the BFS task.
 async fn search_files(config: &SearchConfig) -> mpsc::Receiver<Result<PathBuf>> {
     let (tx, rx) = mpsc::channel(100);
 
-    // Clone arguments for the spawned task
     let root = config.root_path.clone();
     let pattern = config.pattern.clone();
     let exts = config.extensions.clone();
@@ -66,7 +65,6 @@ async fn search_files(config: &SearchConfig) -> mpsc::Receiver<Result<PathBuf>> 
     let include_gitignored = config.include_gitignored;
 
     // Build the Gitignore matcher (only from root/.gitignore)
-    // If there's no .gitignore, or if it fails to parse, we fallback gracefully.
     let gitignore = build_gitignore(&root);
 
     tokio::spawn(async move {
@@ -90,7 +88,7 @@ async fn search_files(config: &SearchConfig) -> mpsc::Receiver<Result<PathBuf>> 
     rx
 }
 
-/// Perform a BFS over directories without using recursion.
+/// Performs BFS without recursion, respecting .gitignore, hidden, patterns, etc.
 async fn crawl_bfs(
     root_dir: &Path,
     max_depth: usize,
@@ -102,8 +100,6 @@ async fn crawl_bfs(
     tx: &mpsc::Sender<Result<PathBuf>>,
 ) -> Result<()> {
     use std::collections::VecDeque;
-
-    // We'll store (directory_path, depth)
     let mut queue = VecDeque::new();
     queue.push_back((root_dir.to_path_buf(), 0));
 
@@ -115,7 +111,7 @@ async fn crawl_bfs(
         let mut entries = match fs::read_dir(&dir).await {
             Ok(e) => e,
             Err(e) => {
-                // If e.g. the directory doesn't exist or we have no permission, send an error and skip
+                // e.g., permission denied or path doesn't exist
                 let _ = tx.send(Err(e.into())).await;
                 continue;
             }
@@ -124,8 +120,7 @@ async fn crawl_bfs(
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
 
-            // If the user does not want to include .gitignore'd files,
-            // skip anything that is matched by .gitignore
+            // If user does NOT want to include gitignored, skip if matched
             if !include_gitignored && is_gitignored(&path, gitignore) {
                 continue;
             }
@@ -138,15 +133,18 @@ async fn crawl_bfs(
                 }
             };
 
+            // hidden check
             if !show_hidden && is_hidden(&path) {
                 continue;
             }
 
+            // BFS queue subdirectories
             if metadata.is_dir() {
                 if depth < max_depth {
                     queue.push_back((path, depth + 1));
                 }
             } else {
+                // If it's a file, check pattern / extension
                 if file_matches(&path, pattern, extensions) {
                     tx.send(Ok(path)).await?;
                 }
@@ -160,17 +158,17 @@ async fn crawl_bfs(
 /// Build a Gitignore object from "root_dir/.gitignore", if it exists.
 fn build_gitignore(root_dir: &Path) -> Option<ignore::gitignore::Gitignore> {
     use ignore::gitignore::GitignoreBuilder;
-
     let gitignore_path = root_dir.join(".gitignore");
+
     if !gitignore_path.is_file() {
-        // No .gitignore in root, or not a file
         return None;
     }
+
     let mut builder = GitignoreBuilder::new(root_dir);
     if builder.add(gitignore_path).is_some() {
-        // If we fail to parse, fallback to ignoring
         return None;
     }
+
     match builder.build() {
         Ok(gi) => Some(gi),
         Err(_) => None,
@@ -187,10 +185,9 @@ fn is_gitignored(path: &Path, gitignore: &Option<ignore::gitignore::Gitignore>) 
     }
 }
 
-/// Cross-platform hidden-file detection
+/// Cross-platform hidden detection
 #[cfg(unix)]
 fn is_hidden(path: &Path) -> bool {
-    // On Unix, hidden if file name starts with '.'
     match path.file_name() {
         Some(name) => name.to_str().map(|s| s.starts_with('.')).unwrap_or(false),
         None => false,
@@ -201,34 +198,28 @@ fn is_hidden(path: &Path) -> bool {
 fn is_hidden(path: &Path) -> bool {
     use std::os::windows::prelude::MetadataExt;
 
-    // On Windows, hidden if the hidden attribute is set
-    // (FILE_ATTRIBUTE_HIDDEN = 0x2).  
-    // We also treat files that literally start with '.' as hidden for user convenience.
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         if name.starts_with('.') {
             return true;
         }
     }
-
     match path.metadata() {
-        Ok(meta) => (meta.file_attributes() & 0x2) != 0,
+        Ok(meta) => (meta.file_attributes() & 0x2) != 0, // FILE_ATTRIBUTE_HIDDEN = 0x2
         Err(_) => false,
     }
 }
 
-/// Check if a file name or extension matches the user’s pattern and extension filters.
+/// Pattern and extension checks
 fn file_matches(path: &Path, pattern: &str, extensions: Option<&[String]>) -> bool {
     let file_name = match path.file_name().and_then(|n| n.to_str()) {
         Some(name) => name,
         None => return false,
     };
 
-    // 1) Naive '*' pattern match
     if pattern != "*" && !naive_pattern_match(file_name, pattern) {
         return false;
     }
 
-    // 2) Extension filter
     if let Some(exts) = extensions {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             if !exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)) {
@@ -243,8 +234,7 @@ fn file_matches(path: &Path, pattern: &str, extensions: Option<&[String]>) -> bo
     true
 }
 
-/// Very naive wildcard: '*' means "any substring".  
-/// For robust matching, consider the `glob` or `regex` crate.
+/// Naive '*' pattern => substring match
 fn naive_pattern_match(name: &str, pat: &str) -> bool {
     if pat == "*" {
         return true;
@@ -262,103 +252,21 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::mpsc::Receiver;
 
-    /// Collect all successful results from the receiver into a sorted Vec.
+    /// Collect all successful PathBuf results
     async fn collect_results(mut rx: Receiver<Result<PathBuf>>) -> Vec<PathBuf> {
-        let mut results = Vec::new();
+        let mut v = Vec::new();
         while let Some(item) = rx.recv().await {
             if let Ok(path) = item {
-                results.push(path);
+                v.push(path);
             }
         }
-        results.sort();
-        results
+        v.sort();
+        v
     }
 
-    #[tokio::test]
-    async fn test_gitignore_default() -> Result<()> {
-        // By default, .gitignore is read, and anything that matches is excluded.
-        let tmp = tempdir()?;
-        let tmp_path = tmp.path();
+    // -- 1) BASIC TESTS --
 
-        // Create .gitignore that ignores *.log
-        let gitignore_path = tmp_path.join(".gitignore");
-        stdfs::write(&gitignore_path, "*.log\n")?;
-
-        // Create files
-        let file_txt = tmp_path.join("notes.txt");
-        let file_log = tmp_path.join("debug.log");
-        stdfs::write(&file_txt, "hello")?;
-        stdfs::write(&file_log, "some logs")?;
-
-        let config = SearchConfig {
-            root_path: tmp_path.to_path_buf(),
-            pattern: "*".into(),
-            max_depth: None,
-            extensions: None,
-            show_hidden: true,
-            include_gitignored: false, // default: do NOT include .gitignore’d
-        };
-
-        let rx = search_files(&config).await;
-        let found = collect_results(rx).await;
-
-        // We expect to see notes.txt, but NOT debug.log
-        assert!(
-            found.contains(&file_txt),
-            "Expected to find notes.txt, but didn't."
-        );
-        assert!(
-            !found.contains(&file_log),
-            "Should NOT have found debug.log if .gitignore is in effect."
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_include_gitignored() -> Result<()> {
-        // If the user sets --include-gitignored, we ignore the .gitignore instructions.
-        let tmp = tempdir()?;
-        let tmp_path = tmp.path();
-
-        // Create .gitignore that ignores *.log
-        let gitignore_path = tmp_path.join(".gitignore");
-        stdfs::write(&gitignore_path, "*.log\n")?;
-
-        // Create files
-        let file_txt = tmp_path.join("notes.txt");
-        let file_log = tmp_path.join("debug.log");
-        stdfs::write(&file_txt, "hello")?;
-        stdfs::write(&file_log, "some logs")?;
-
-        let config = SearchConfig {
-            root_path: tmp_path.to_path_buf(),
-            pattern: "*".into(),
-            max_depth: None,
-            extensions: None,
-            show_hidden: true,
-            include_gitignored: true, // override .gitignore
-        };
-
-        let rx = search_files(&config).await;
-        let found = collect_results(rx).await;
-
-        // We expect to see BOTH notes.txt AND debug.log
-        assert!(
-            found.contains(&file_txt),
-            "Expected to find notes.txt, but didn't."
-        );
-        assert!(
-            found.contains(&file_log),
-            "Expected to find debug.log, but didn't."
-        );
-
-        Ok(())
-    }
-
-    // We can still reuse the tests from before, verifying BFS, hidden-file logic, etc.
-    // A few are shown below; you could copy the entire suite from the previous example.
-
+    /// Basic BFS search with no .gitignore
     #[tokio::test]
     async fn test_search_basic() -> Result<()> {
         let tmp = tempdir()?;
@@ -380,17 +288,406 @@ mod tests {
             pattern: "*".into(),
             max_depth: None,
             extensions: None,
-            show_hidden: false, // do NOT show hidden
+            show_hidden: false,
             include_gitignored: false,
         };
-
-        let rx = search_files(&config).await;
-        let found = collect_results(rx).await;
+        let found = collect_results(search_files(&config).await).await;
 
         let mut expected = vec![file1, file2, file3];
         expected.sort();
         assert_eq!(found, expected);
 
+        Ok(())
+    }
+
+    /// Searching an empty directory yields no files
+    #[tokio::test]
+    async fn test_empty_dir() -> Result<()> {
+        let tmp = tempdir()?;
+        let tmp_path = tmp.path();
+
+        let config = SearchConfig {
+            root_path: tmp_path.to_path_buf(),
+            pattern: "*".into(),
+            max_depth: None,
+            extensions: None,
+            show_hidden: false,
+            include_gitignored: false,
+        };
+        let found = collect_results(search_files(&config).await).await;
+        assert_eq!(found.len(), 0, "Expected no files in empty directory");
+        Ok(())
+    }
+
+    /// If the directory doesn't exist, we should get an error, but no results
+    #[tokio::test]
+    async fn test_non_existent_directory() -> Result<()> {
+        let non_existent = PathBuf::from("X:/some-non-existent-1234");
+        let config = SearchConfig {
+            root_path: non_existent,
+            pattern: "*".into(),
+            max_depth: None,
+            extensions: None,
+            show_hidden: true,
+            include_gitignored: false,
+        };
+        let rx = search_files(&config).await;
+
+        let mut files = Vec::new();
+        let mut errors = 0usize;
+
+        let mut chan = rx;
+        while let Some(msg) = chan.recv().await {
+            match msg {
+                Ok(path) => files.push(path),
+                Err(_) => errors += 1,
+            }
+        }
+
+        assert_eq!(files.len(), 0);
+        assert!(errors >= 1, "Should have at least one error from non-existent dir");
+
+        Ok(())
+    }
+
+    // -- 2) HIDDEN FILES --
+
+    /// We skip hidden files by default, show them if show_hidden = true
+    #[tokio::test]
+    async fn test_hidden_files() -> Result<()> {
+        let tmp = tempdir()?;
+        let tmp_path = tmp.path();
+
+        // Create hidden file
+        let hidden_file = tmp_path.join(".hidden.txt");
+        stdfs::write(&hidden_file, "secret")?;
+
+        // By default, show_hidden = false => we won't see it
+        let config = SearchConfig {
+            root_path: tmp_path.to_path_buf(),
+            pattern: "*".into(),
+            max_depth: None,
+            extensions: None,
+            show_hidden: false,
+            include_gitignored: false,
+        };
+        let found = collect_results(search_files(&config).await).await;
+        assert!(
+            !found.contains(&hidden_file),
+            "Should NOT see hidden_file when show_hidden is false"
+        );
+
+        // If we set show_hidden = true => we do see it
+        let config2 = SearchConfig {
+            show_hidden: true,
+            ..config
+        };
+        let found2 = collect_results(search_files(&config2).await).await;
+        assert!(
+            found2.contains(&hidden_file),
+            "Expected to see hidden_file when show_hidden is true"
+        );
+
+        Ok(())
+    }
+
+    // -- 3) EXTENSIONS --
+
+    #[tokio::test]
+    async fn test_search_extensions() -> Result<()> {
+        let tmp = tempdir()?;
+        let tmp_path = tmp.path();
+
+        let file_txt = tmp_path.join("hello.txt");
+        let file_md = tmp_path.join("readme.md");
+        stdfs::write(&file_txt, "hello")?;
+        stdfs::write(&file_md, "# readme")?;
+
+        let config = SearchConfig {
+            root_path: tmp_path.to_path_buf(),
+            pattern: "*".into(),
+            max_depth: None,
+            extensions: Some(vec!["txt".into()]),
+            show_hidden: true,
+            include_gitignored: false,
+        };
+        let found = collect_results(search_files(&config).await).await;
+
+        // Expect to see only hello.txt
+        assert!(found.contains(&file_txt), "Expected to see .txt file");
+        assert!(!found.contains(&file_md), "Should NOT see .md file");
+        Ok(())
+    }
+
+    // -- 4) MAX DEPTH --
+
+    #[tokio::test]
+    async fn test_max_depth() -> Result<()> {
+        let tmp = tempdir()?;
+        let tmp_path = tmp.path();
+
+        // Create a multi-level directory
+        // root
+        //   level1/
+        //     level2/
+        //       file.txt
+        let level1 = tmp_path.join("level1");
+        let level2 = level1.join("level2");
+        stdfs::create_dir_all(&level2)?;
+
+        let file_txt = level2.join("deep_file.txt");
+        stdfs::write(&file_txt, "deep")?;
+
+        // max_depth = 1 => we see items in root, but not in level1/level2
+        let config = SearchConfig {
+            root_path: tmp_path.to_path_buf(),
+            pattern: "*".into(),
+            max_depth: Some(1),
+            extensions: None,
+            show_hidden: true,
+            include_gitignored: false,
+        };
+        let found = collect_results(search_files(&config).await).await;
+        assert!(!found.contains(&file_txt), "Should not see file at depth 2");
+
+        // max_depth = 2 => we can see file_txt
+        let config2 = SearchConfig {
+            max_depth: Some(2),
+            ..config
+        };
+        let found2 = collect_results(search_files(&config2).await).await;
+        assert!(found2.contains(&file_txt), "Should see file at depth 2");
+        Ok(())
+    }
+
+    // -- 5) GITIGNORE SCENARIOS --
+
+    /// .gitignore ignores *.log by default
+    #[tokio::test]
+    async fn test_gitignore_default() -> Result<()> {
+        let tmp = tempdir()?;
+        let tmp_path = tmp.path();
+
+        // Create .gitignore that ignores *.log
+        let gitignore_path = tmp_path.join(".gitignore");
+        stdfs::write(&gitignore_path, "*.log\n")?;
+
+        // Create files
+        let file_txt = tmp_path.join("notes.txt");
+        let file_log = tmp_path.join("debug.log");
+        stdfs::write(&file_txt, "hello")?;
+        stdfs::write(&file_log, "some logs")?;
+
+        let config = SearchConfig {
+            root_path: tmp_path.to_path_buf(),
+            pattern: "*".into(),
+            max_depth: None,
+            extensions: None,
+            show_hidden: true,
+            include_gitignored: false,
+        };
+        let found = collect_results(search_files(&config).await).await;
+
+        // We expect to see notes.txt, but NOT debug.log
+        assert!(found.contains(&file_txt), "Expected to find notes.txt");
+        assert!(
+            !found.contains(&file_log),
+            "Should NOT find debug.log if it's .gitignored"
+        );
+
+        Ok(())
+    }
+
+    /// If --include-gitignored is set, we see all files
+    #[tokio::test]
+    async fn test_include_gitignored() -> Result<()> {
+        let tmp = tempdir()?;
+        let tmp_path = tmp.path();
+
+        // .gitignore
+        let gitignore_path = tmp_path.join(".gitignore");
+        stdfs::write(&gitignore_path, "*.log\n")?;
+
+        // Create files
+        let file_txt = tmp_path.join("notes.txt");
+        let file_log = tmp_path.join("debug.log");
+        stdfs::write(&file_txt, "hello")?;
+        stdfs::write(&file_log, "some logs")?;
+
+        let config = SearchConfig {
+            root_path: tmp_path.to_path_buf(),
+            pattern: "*".into(),
+            max_depth: None,
+            extensions: None,
+            show_hidden: true,
+            include_gitignored: true, // override ignoring
+        };
+        let found = collect_results(search_files(&config).await).await;
+
+        assert!(found.contains(&file_txt));
+        assert!(
+            found.contains(&file_log),
+            "Expected to see log file, ignoring .gitignore"
+        );
+        Ok(())
+    }
+
+    /// Multiple lines in .gitignore, plus blank lines and comments
+    #[tokio::test]
+    async fn test_gitignore_multi_line() -> Result<()> {
+        let tmp = tempdir()?;
+        let tmp_path = tmp.path();
+
+        // .gitignore content
+        let content = r#"
+            # This is a comment
+            *.log
+            secret_*
+            
+            # blank line above
+            *.tmp
+        "#;
+        let gitignore_path = tmp_path.join(".gitignore");
+        stdfs::write(&gitignore_path, content)?;
+
+        // Create files
+        let f_log = tmp_path.join("debug.log");
+        let f_secret = tmp_path.join("secret_file.txt");
+        let f_tmp = tmp_path.join("random.tmp");
+        let f_txt = tmp_path.join("notes.txt");
+
+        stdfs::write(&f_log, "log")?;
+        stdfs::write(&f_secret, "secret")?;
+        stdfs::write(&f_tmp, "tmp data")?;
+        stdfs::write(&f_txt, "notes")?;
+
+        let config = SearchConfig {
+            root_path: tmp_path.to_path_buf(),
+            pattern: "*".into(),
+            max_depth: None,
+            extensions: None,
+            show_hidden: true,
+            include_gitignored: false,
+        };
+        let found = collect_results(search_files(&config).await).await;
+
+        // Only notes.txt is not ignored
+        assert!(found.contains(&f_txt));
+        assert!(!found.contains(&f_log), "Should ignore *.log");
+        assert!(!found.contains(&f_secret), "Should ignore secret_*");
+        assert!(!found.contains(&f_tmp), "Should ignore *.tmp");
+        Ok(())
+    }
+
+    /// .gitignore that doesn't exist => no ignoring
+    #[tokio::test]
+    async fn test_no_gitignore_file() -> Result<()> {
+        let tmp = tempdir()?;
+        let tmp_path = tmp.path();
+
+        // There's no .gitignore
+        let file_log = tmp_path.join("debug.log");
+        stdfs::write(&file_log, "some logs")?;
+
+        // Should see debug.log
+        let config = SearchConfig {
+            root_path: tmp_path.to_path_buf(),
+            pattern: "*".into(),
+            max_depth: None,
+            extensions: None,
+            show_hidden: true,
+            include_gitignored: false,
+        };
+        let found = collect_results(search_files(&config).await).await;
+        assert!(found.contains(&file_log));
+        Ok(())
+    }
+
+    // -- 6) PATTERN SPECIFICS --
+
+    #[tokio::test]
+    async fn test_pattern_substring() -> Result<()> {
+        let tmp = tempdir()?;
+        let tmp_path = tmp.path();
+
+        let abc = tmp_path.join("abc-file.txt");
+        let xyz = tmp_path.join("xyz-file.txt");
+        stdfs::write(&abc, "abc")?;
+        stdfs::write(&xyz, "xyz")?;
+
+        // Pattern "abc*" => naive substring check => matches "abc-file.txt"
+        let config = SearchConfig {
+            root_path: tmp_path.to_path_buf(),
+            pattern: "abc*".into(),
+            max_depth: None,
+            extensions: None,
+            show_hidden: true,
+            include_gitignored: false,
+        };
+        let found = collect_results(search_files(&config).await).await;
+
+        assert!(found.contains(&abc));
+        assert!(!found.contains(&xyz));
+        Ok(())
+    }
+
+    // -- 7) PERMISSION ERRORS --
+
+    #[tokio::test]
+    async fn test_permission_denied() -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let tmp = tempdir()?;
+            let tmp_path = tmp.path();
+
+            // We create an unreadable directory
+            let locked_dir = tmp_path.join("locked");
+            stdfs::create_dir_all(&locked_dir)?;
+
+            // Then remove read permissions
+            let mut perms = stdfs::metadata(&locked_dir)?.permissions();
+            perms.set_mode(0o000); // no permissions
+            stdfs::set_permissions(&locked_dir, perms)?;
+
+            // BFS should return an error for locked_dir, but it won't crash
+            let config = SearchConfig {
+                root_path: tmp_path.to_path_buf(),
+                pattern: "*".into(),
+                max_depth: None,
+                extensions: None,
+                show_hidden: true,
+                include_gitignored: false,
+            };
+            let rx = search_files(&config).await;
+
+            let mut files_found = Vec::new();
+            let mut errors = 0;
+            let mut channel = rx;
+            while let Some(item) = channel.recv().await {
+                match item {
+                    Ok(p) => files_found.push(p),
+                    Err(_) => errors += 1,
+                }
+            }
+
+            // We didn't create any files, so no found paths
+            // We do expect at least 1 error from locked_dir
+            assert_eq!(files_found.len(), 0);
+            assert!(
+                errors >= 1,
+                "Expected at least one error from permission-denied directory"
+            );
+
+            // Reset permissions so tempdir can clean up
+            let mut perms2 = stdfs::metadata(&locked_dir)?.permissions();
+            perms2.set_mode(0o755);
+            stdfs::set_permissions(&locked_dir, perms2)?;
+        }
+
+        // On Windows, setting read-only to a directory doesn't yield the same error pattern.
+        // We'll skip this scenario on Windows or handle with other approaches.
         Ok(())
     }
 }
