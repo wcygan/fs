@@ -708,4 +708,54 @@ secret_*
         // We'll skip this scenario on Windows or handle with other approaches.
         Ok(())
     }
+    
+    use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+    
+    /// Arbitrary string generator for QuickCheck
+    /// This example just generates ASCII strings of modest length;
+    /// tweak as needed for your use cases.
+    #[derive(Clone, Debug)]
+    struct RandomString(pub String);
+
+    impl Arbitrary for RandomString {
+        fn arbitrary(g: &mut Gen) -> Self {
+            // Generate ASCII characters only, up to 50 in length
+            let size = usize::arbitrary(g) % 50;
+            let s: String = (0..size)
+                .map(|_| {
+                    let c = u8::arbitrary(g) % 128; // ASCII range
+                    c as char
+                })
+                .collect();
+            RandomString(s)
+        }
+    }
+
+    /// Property: If the pattern is "*", then naive_pattern_match() should
+    /// always return true for any input string.
+    #[test]
+    fn prop_star_matches_all_strings() {
+            fn prop(s: RandomString) -> TestResult {
+                let pat = "*";
+                let matched = naive_pattern_match(&s.0, pat);
+                // This should *always* be true
+                TestResult::from_bool(matched)
+            }
+            QuickCheck::new().quickcheck(prop as fn(RandomString) -> TestResult);
+        }
+
+    /// Property: If the pattern does not contain '*', then `naive_pattern_match`
+    /// is effectively `string.contains(pat)`.
+    #[test]
+    fn prop_substring_equivalent() {
+        fn inner(s: RandomString, pat: RandomString) -> TestResult {
+            // We artificially remove '*' from `pat` to test substring logic
+            let pat_no_star = pat.0.replace('*', "");
+            let direct_contains = s.0.contains(&pat_no_star);
+            let our_match = naive_pattern_match(&s.0, &pat_no_star);
+
+            TestResult::from_bool(direct_contains == our_match)
+        }
+        QuickCheck::new().quickcheck(inner as fn(RandomString, RandomString) -> TestResult);
+    }
 }
